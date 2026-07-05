@@ -1,4 +1,4 @@
-// server.js - OpenAI to NVIDIA NIM API Proxy
+// server.js - OpenAI to NVIDIA NIM API Proxy (Versão Corrigida)
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -95,8 +95,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     const nimRequest = {
       model: nimModel,
       messages: messages,
-      temperature: temperature || 0.6,
-      max_tokens: max_tokens || 9024,
+      temperature: temperature !== undefined ? temperature : 0.7,
+      max_tokens: max_tokens || 4096, // Reduzido para evitar loops e estouros de contexto
       extra_body: ENABLE_THINKING_MODE ? { chat_template_kwargs: { thinking: true } } : undefined,
       stream: stream || false
     };
@@ -111,7 +111,6 @@ app.post('/v1/chat/completions', async (req, res) => {
     });
     
     if (stream) {
-      // Handle streaming response with reasoning
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
@@ -124,22 +123,28 @@ app.post('/v1/chat/completions', async (req, res) => {
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
         
-        lines.forEach(line => {
+        for (let line of lines) {
+          line = line.trim();
+          if (!line) continue;
+          
           if (line.startsWith('data: ')) {
             if (line.includes('[DONE]')) {
-              res.write(line + '\n');
-              return;
+              res.write('data: [DONE]\n\n');
+              continue;
             }
             
             try {
-              const data = JSON.parse(line.slice(6));
+              const cleanedLine = line.slice(6).trim();
+              if (!cleanedLine) continue;
+              
+              const data = JSON.parse(cleanedLine);
               if (data.choices?.[0]?.delta) {
-                const reasoning = data.choices[0].delta.reasoning_content;
-                const content = data.choices[0].delta.content;
+                const reasoning = data.choices[0].delta.reasoning_content || '';
+                const content = data.choices[0].delta.content || '';
+                
+                let combinedContent = '';
                 
                 if (SHOW_REASONING) {
-                  let combinedContent = '';
-                  
                   if (reasoning && !reasoningStarted) {
                     combinedContent = '<think>\n' + reasoning;
                     reasoningStarted = true;
@@ -148,31 +153,30 @@ app.post('/v1/chat/completions', async (req, res) => {
                   }
                   
                   if (content && reasoningStarted) {
-                    combinedContent += '</think>\n\n' + content;
+                    combinedContent += '\n</think>\n\n' + content;
                     reasoningStarted = false;
                   } else if (content) {
                     combinedContent += content;
                   }
-                  
-                  if (combinedContent) {
-                    data.choices[0].delta.content = combinedContent;
-                    delete data.choices[0].delta.reasoning_content;
-                  }
                 } else {
-                  if (content) {
-                    data.choices[0].delta.content = content;
-                  } else {
-                    data.choices[0].delta.content = '';
-                  }
+                  // Se não quer mostrar o raciocínio, ignora o reasoning_content
+                  combinedContent = content;
+                }
+                
+                // Sobrescreve garantindo que vá apenas texto limpo
+                data.choices[0].delta.content = combinedContent;
+                if (data.choices[0].delta.reasoning_content) {
                   delete data.choices[0].delta.reasoning_content;
                 }
               }
+              
               res.write(`data: ${JSON.stringify(data)}\n\n`);
             } catch (e) {
-              res.write(line + '\n');
+              // Se falhar o parse, ignora a linha corrompida em vez de repassar lixo pro front
+              console.error("Erro no parse da linha do stream:", e.message);
             }
           }
-        });
+        }
       });
       
       response.data.on('end', () => res.end());
@@ -181,7 +185,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         res.end();
       });
     } else {
-      // Transform NIM response to OpenAI format with reasoning
+      // Código de resposta não-stream
       const openaiResponse = {
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
@@ -215,13 +219,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     
   } catch (error) {
     console.error('Proxy error:', error.message);
-    
     res.status(error.response?.status || 500).json({
-      error: {
-        message: error.message || 'Internal server error',
-        type: 'invalid_request_error',
-        code: error.response?.status || 500
-      }
+      error: { message: error.message || 'Internal server error' }
     });
   }
 });
@@ -239,7 +238,4 @@ app.all('*', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`OpenAI to NVIDIA NIM Proxy running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
-  console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
 });
